@@ -1,0 +1,23 @@
+#!/usr/bin/env sh
+# Blocks commits containing secrets (API keys, credentials, private keys, etc.)
+# Runs gitleaks against staged changes only.
+
+set -e
+
+# Prevents Git-Bash-on-Windows from rewriting the container's /repo path
+# into a host filesystem path before it reaches `docker run`.
+export MSYS_NO_PATHCONV=1
+
+GITLEAKS_ARGS="protect --staged --redact --verbose"
+
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks $GITLEAKS_ARGS
+elif command -v docker >/dev/null 2>&1; then
+  docker run --rm -v "$(pwd):/repo" -w /repo zricethezav/gitleaks:latest $GITLEAKS_ARGS
+else
+  echo ""
+  echo "[pre-commit] gitleaks not found and Docker is unavailable — cannot secret-scan this commit."
+  echo "[pre-commit] Install gitleaks (https://github.com/gitleaks/gitleaks#installing) or Docker Desktop, then retry."
+  echo ""
+  exit 1
+fi

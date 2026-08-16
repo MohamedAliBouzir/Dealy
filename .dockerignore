@@ -1,0 +1,19 @@
+node_modules
+dist
+.git
+.gitignore
+README.md
+Dockerfile
+.dockerignore
+coverage
+test
+*.md
+
+# Secrets — must never end up in a build context/image layer
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/

@@ -1,0 +1,23 @@
+node_modules/
+dist
+coverage
+*.js.map
+*.d.ts
+!eslint.config.mjs
+.env
+.env.*
+!.env.example
+
+# Secrets / credentials — never commit real material
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+infra/nginx/certs/*
+!infra/nginx/certs/.gitkeep
+infra/vault/data/
+infra/vault/*unseal*
+*.unseal
+vault-init.json
