@@ -1,4 +1,4 @@
-# Vault — Phase 2
+# Vault — Phase 2 + 3
 
 Vault is the secrets backbone from this point forward. Nothing generated
 from Phase 3 onward (Keycloak client secrets, the app's DB credentials, JWT
@@ -44,48 +44,195 @@ Whoever is holding the shares is responsible for storing them separately
 from one another (that's the entire point of a 3-of-5 threshold: no single
 stored location is enough on its own).
 
-**Root token usage should be minimal from here on — revoke it the moment
-bootstrap is done, don't just set it aside.** It was needed once to run
-`bootstrap.sh` (enable the KV engine, write the policy, create the
-AppRole). As soon as that finishes:
+> **Status (closed): the original Phase 2 root token was revoked by the
+> human directly**, as the first step of Phase 3's setup (it was used once
+> for `bootstrap.sh`, never revoked afterward, and separately appeared in
+> full plaintext in the chat transcript twice — breaking the "shown once,
+> never persisted" design regardless of file/log handling). Getting a
+> working `keycloak-writer` policy + token took three ceremony rounds after
+> that — two hit real bugs (rules 1 and 4 below), both fixed and now
+> documented as standing procedure rather than left as one-off patches. The
+> third round succeeded cleanly: `keycloak-writer` exists, its token is
+> live and orphaned, and the ceremony's temporary root token was revoked
+> and independently confirmed dead.
+
+## Privileged Vault access: regenerate-on-demand, no standing admin identity
+
+**Decision (locked, Phase 3): there is no persistent admin identity in
+Vault.** No standing operator account, nothing left logged in between
+sessions. Every time privileged work is needed — creating a policy,
+enabling an auth method — root is regenerated from scratch via the
+unseal-key holders' ceremony, used for exactly that task, then destroyed
+again immediately. This is deliberately higher-friction than a standing
+identity; the tradeoff is that root never exists at rest.
+
+**This procedure is human-performed, interactively.** The agent does not
+run any command that embeds the root token, an unseal key, or the
+generate-root OTP as literal text — same boundary as the original
+unseal/init handoff in Phase 2. What the agent *can* do afterward is run
+follow-up commands that ride on a session the human already authenticated
+inside the container (via `vault login`, so nothing about that session's
+token is ever typed into an agent-run command) — mirroring how Phase 2's
+KV v2/AppRole bootstrap worked once the human had unsealed and handed off.
+
+The full procedure, repeated in full every time privileged access is
+needed (Phase 3's `keycloak-writer` policy, Phase 4's own policy/AppRole
+work, and beyond):
 
 ```sh
-docker exec -e VAULT_TOKEN=<root token> dealy-vault-1 vault token revoke -self
+# 1. Start a new ceremony (produces a nonce and an OTP)
+docker exec -it dealy-vault-1 vault operator generate-root -init
+
+# 2. Once per key share, up to the threshold (3) — hidden-input prompt,
+#    same pattern as unsealing. Run 3 times total, using -nonce=<nonce from step 1>.
+docker exec -it dealy-vault-1 vault operator generate-root -nonce=<nonce>
+
+# 3. Decode the result locally to get the usable temporary root token
+docker exec -it dealy-vault-1 vault operator generate-root -decode=<encoded> -otp=<otp>
+
+# 4. Log the temporary root token in *inside the container*, interactively —
+#    the token is typed at a hidden prompt, never as a literal command
+#    argument, and -no-print suppresses it being echoed back in the success
+#    output. This persists a session file inside the container that
+#    subsequent `docker exec ... vault ...` calls pick up automatically,
+#    with no token ever appearing in an agent-run command.
+docker exec -it dealy-vault-1 vault login -no-print
 ```
 
-This does not lock you out permanently — a new root token can always be
-minted later via `vault operator generate-root`, which is authorized using
-the unseal key shares (a challenge-response flow), not the old token. That
-mechanism is the intended way to regain root access if it's ever genuinely
-needed again; keeping the original root token alive "just in case" instead
-is the thing to avoid.
+At that point the agent runs the secret-free configuration commands the
+task needs against that persisted session — subject to the five rules
+below, which apply to every future ceremony (Phase 4's own policy/AppRole
+work included), not just this one:
 
-> **Status as of this phase's setup (2026-08-16): treat this token as
-> compromised, not merely un-revoked.** The root token generated during
-> `vault operator init` was used to run `bootstrap.sh` and never revoked —
-> and separately, it appeared in full plaintext in the chat transcript
-> twice (the original one-time reveal, and again in a later recap). A chat
-> transcript is a durable record, so the "shown once, never persisted"
-> design goal was already broken independent of whether it was ever written
-> to a file. This is not a queued cleanup item — it is the **first command
-> run, before anything else**, the next time this Vault is unsealed. Delete
-> this status note only after that revoke has actually happened.
+**1. Never pass a file as a path argument to a `docker exec`'d Vault
+command — pipe it via stdin instead.** A path argument like
+`/tmp/policy.hcl` is subject to Git-Bash-on-Windows silently rewriting it
+into a Windows path before `docker exec` ever sees it (the same class of
+bug already worked around once with `MSYS_NO_PATHCONV=1` for the
+self-signed-cert script and the gitleaks hook — and re-hit here because
+that fix wasn't reapplied). Piping sidesteps the bug class entirely rather
+than working around it with an environment variable:
+
+```sh
+cat infra/vault/policies/<name>.hcl | docker exec -i dealy-vault-1 vault policy write <name> -
+```
+
+**2. Verify each step independently before the next one runs — especially
+before anything irreversible — don't rely on `set -e` alone.** A failing
+`docker exec` doesn't reliably abort a chained script (observed directly:
+a failed `vault policy write` didn't stop a script from reaching a `token
+revoke -self` two steps later). Gate each step explicitly:
+
+```sh
+# after writing a policy — confirm it actually exists with the right content
+docker exec dealy-vault-1 vault policy read <name> | grep -q '<expected path>' \
+  || { echo "ABORT: policy verification failed"; exit 1; }
+
+# after minting a token — confirm the file is non-empty before trusting it
+docker exec dealy-vault-1 sh -c 'test -s /tmp/token.json' \
+  || { echo "ABORT: token mint verification failed"; exit 1; }
+```
+
+Only once every prior step is independently confirmed does a revoke run.
+
+**3. Never run a bare `vault token lookup` (or `-self`) if the output will
+be shown or logged — it echoes the full token value back in its `id`
+field, on success.** This isn't hypothetical: it happened once already,
+during this phase's setup, checking whether a session was authenticated as
+root. Use `vault token capabilities <some path>` instead for any
+"is this session valid / what can it do" check — it reports the same kind
+of information (or the same `permission denied / invalid token` failure
+once a token is revoked) without ever including the token value in either
+its success or failure output:
+
+```sh
+docker exec dealy-vault-1 vault token capabilities secret/data/keycloak/test
+```
+
+**4. Any token that needs to outlive the ceremony's root session must be
+created with `-orphan` — otherwise revoking root kills it too.**
+`vault token create` without `-orphan` makes the new token a *child* of
+whatever session created it; Vault cascades revocation from parent to
+child by default. Minting `keycloak-writer`'s working token from the
+temporary root session, then revoking that root session, silently revoked
+`keycloak-writer` along with it — discovered when `vault login` failed
+with `permission denied / invalid token` on a token that had just been
+successfully minted:
+
+```sh
+docker exec dealy-vault-1 sh -c "vault token create -orphan -policy=<name> -ttl=<ttl> -format=json > /tmp/token.json"
+```
+
+Before revoking root, use the new token's non-secret **accessor** (shown
+via rule 3's pattern) to confirm it's both correctly scoped and marked
+`orphan: true` — this check would have caught the bug above before the
+irreversible revoke ran, rather than after:
+
+```sh
+docker exec dealy-vault-1 vault token lookup -accessor=<accessor>
+```
+
+`lookup -accessor=` is safe to run and display even though bare/`-self`
+`lookup` (rule 3) is not — looking up a *different* token by its accessor
+returns policies/ttl/orphan-status metadata without ever including that
+token's `id` field, unlike a self-lookup.
+
+Once the privileged work is done and the new token's independence is
+confirmed:
+
+```sh
+# Revoke the temporary root token — it must not persist "just in case"
+docker exec dealy-vault-1 vault token revoke -self
+
+# Prove it, don't just trust the command's own output — this must now fail
+docker exec dealy-vault-1 vault token capabilities secret/data/keycloak/test
+```
+
+**5. Any cleanup/delete step against a container path needs an explicit
+existence-check afterward — `rm -f`'s silent success proves nothing.**
+Unlike rule 1's other failure modes (which error loudly), a path-conversion
+bug hitting `rm -f` doesn't error at all: it silently no-ops on the
+mangled, nonexistent path and exits 0, indistinguishable from genuinely
+having deleted the file. This let a short-lived token's plaintext sit at
+rest in `/tmp` inside the container for the rest of a session — not
+exposed anywhere, but longer-lived than intended, and discovered only by
+chance via an unrelated `ls`:
+
+```sh
+docker exec dealy-vault-1 rm -f /tmp/token.json /tmp/token
+docker exec dealy-vault-1 sh -c "ls /tmp/ 2>&1"   # confirm it's actually empty, don't trust rm's exit code
+```
+
+No root token exists at rest between ceremonies. This is the standard path
+for any future privileged Vault change (new policies, new auth methods) —
+Phase 4 uses it again for its own setup, and so on.
 
 ## Secrets engine: KV v2
 
 Enabled at `secret/` (`vault secrets enable -path=secret kv-v2`).
 Versioned, so credential rotation has history.
 
-Reserved path structure — **documented here, not populated in Vault**.
-Nothing gets written to these paths until the phase that actually needs the
-value exists:
+Reserved path structure. `secret/keycloak/*` is now populated (Phase 3);
+the rest are still documented only, not populated:
 
 ```
-secret/keycloak/     client secrets, admin credentials     — Phase 3
+secret/keycloak/     client secrets, admin credentials     — Phase 3 (populated)
 secret/app-db/       NestJS Postgres credentials            — Phase 4
 secret/jwt/          signing keys                           — Phase 4
 secret/minio/        access/secret keys                     — Phase 4
 ```
+
+## `keycloak-writer` policy (Phase 3 bootstrap only)
+
+- Policy `keycloak-writer` (`infra/vault/policies/keycloak-writer.hcl`):
+  `create`+`update`+`read` on `secret/data/keycloak/*` only. Same shape as
+  `app-readonly` below — one path prefix, minimum verbs, nothing else.
+- Not bound to a standing AppRole — this is a one-time provisioning script,
+  not a persistent running service. It was granted to a short-lived token
+  (`vault token create -policy=keycloak-writer -ttl=...`) issued from a
+  temporary root session created via the regenerate-on-demand ceremony
+  above, used only to write the Phase 3 client secrets, and left to expire
+  naturally rather than kept around.
 
 ## AppRole auth (for the app, not the root token)
 

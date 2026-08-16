@@ -128,6 +128,13 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    environment:
+      # command: bakes the password into the process's own --requirepass arg
+      # at container creation; this is separate and makes it available as an
+      # actual env var *inside* the container, which the healthcheck below
+      # needs — without it, $REDIS_PASSWORD is unset in-container and every
+      # healthcheck attempt silently authenticates with an empty password.
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
     volumes:
       - redis-data:/data
     networks:
@@ -194,7 +201,11 @@ services:
       keycloak:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
+      # 127.0.0.1, not localhost: this container's resolver returns ::1 for
+      # "localhost" ahead of 127.0.0.1, and nginx.conf only listens on IPv4 —
+      # so "localhost" hit a real connection-refused on every check. Verified
+      # live: 127.0.0.1/healthz succeeds, localhost/healthz doesn't.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
