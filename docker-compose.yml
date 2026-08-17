@@ -41,12 +41,20 @@ services:
   app-db:
     image: postgres:16-alpine
     restart: unless-stopped
+    # The stock image's default pg_hba.conf uses `trust` for Unix
+    # socket/loopback connections — meaning anything connecting via
+    # localhost (or a bare socket) authenticates with no password check at
+    # all. Confirmed live during Phase 4 that this produced false "the
+    # password is correct" confirmations. hba_file overrides it with a
+    # version requiring real scram-sha-256 auth everywhere, no exceptions.
+    command: postgres -c hba_file=/etc/postgresql/pg_hba.conf
     environment:
       POSTGRES_USER: ${APP_DB_USER}
       POSTGRES_PASSWORD: ${APP_DB_PASSWORD}
       POSTGRES_DB: ${APP_DB_NAME}
     volumes:
       - app-db-data:/var/lib/postgresql/data
+      - ./infra/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     networks:
       - data-net-appdb
     healthcheck:
@@ -58,12 +66,17 @@ services:
   keycloak-db:
     image: postgres:16-alpine
     restart: unless-stopped
+    # Same reasoning as app-db above — the stock image's default
+    # pg_hba.conf trusts Unix socket/loopback connections with no password
+    # check. Same override, same file (it's generic, not app-db-specific).
+    command: postgres -c hba_file=/etc/postgresql/pg_hba.conf
     environment:
       POSTGRES_USER: ${KEYCLOAK_DB_USER}
       POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
       POSTGRES_DB: ${KEYCLOAK_DB_NAME}
     volumes:
       - keycloak-db-data:/var/lib/postgresql/data
+      - ./infra/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     networks:
       - data-net-keycloakdb
     healthcheck:
@@ -210,24 +223,45 @@ services:
       timeout: 5s
       retries: 5
 
-  # ---------------------------------------------------------------------------
-  # Placeholders — not started this phase. Left here so the next phase attaches
-  # to an already-designed topology instead of inventing one under time pressure.
-  # ---------------------------------------------------------------------------
-
-  # nestjs-api:
-  #   build: .
-  #   networks:
-  #     - app-net
-  #     - data-net-appdb
-  #     - data-net-minio
-  #   depends_on:
-  #     app-db:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #     minio:
-  #       condition: service_healthy
+  nestjs-api:
+    build: .
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      VAULT_ADDR: http://vault:8200
+      VAULT_ROLE_ID_FILE: /run/secrets/role_id
+      VAULT_SECRET_ID_FILE: /run/secrets/secret_id
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: dealy
+    volumes:
+      - ./infra/vault/approle:/run/secrets:ro
+    networks:
+      - app-net
+      - data-net-appdb
+      - data-net-minio
+    # Deliberately no `vault: condition: service_healthy` — vault has no
+    # auto-unseal (see infra/vault/README.md) and comes back sealed after
+    # every restart, requiring a human. Gating on it here would mean the
+    # whole stack appears to hang until someone manually unseals vault.
+    # Instead: VaultService fails loud on its own if vault is unreachable
+    # (see src/vault/vault.service.ts), and `restart: unless-stopped`
+    # turns that into a visible crash-loop until vault becomes available
+    # — self-healing without an operational footgun.
+    depends_on:
+      app-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   # zookeeper / kafka:
   #   networks:

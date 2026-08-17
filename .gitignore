@@ -3,10 +3,14 @@ dist
 coverage
 *.js.map
 *.d.ts
+*.tsbuildinfo
 !eslint.config.mjs
 .env
 .env.*
 !.env.example
+
+# Regenerated from prisma/schema.prisma at build time — never committed.
+src/generated/
 
 # Secrets / credentials — never commit real material
 *.pem
@@ -21,3 +25,8 @@ infra/vault/data/
 infra/vault/*unseal*
 *.unseal
 vault-init.json
+
+# AppRole credentials (role_id/secret_id) — mounted into the app container,
+# never committed. Directory created and gitignored before either file
+# exists (Phase 4 requirement, not an afterthought).
+infra/vault/approle/

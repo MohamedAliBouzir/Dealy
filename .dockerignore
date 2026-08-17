@@ -9,6 +9,13 @@ coverage
 test
 *.md
 
+# Stale local incremental-build cache — outside dist/, so deleteOutDir
+# doesn't clear it. Left uncopied, a stray one from the host silently made
+# tsc's incremental mode skip recompiling most files inside the container,
+# only emitting output for files it considered "changed" relative to a
+# cache built on a different machine.
+*.tsbuildinfo
+
 # Secrets — must never end up in a build context/image layer
 .env
 .env.*

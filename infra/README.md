@@ -1,22 +1,24 @@
-# Infrastructure — Phase 1 + 2
+# Infrastructure — Phase 1–4
 
-This is infra only: containers, network topology, secrets discipline. No
-application code runs inside any of these services yet.
+Phases 1–3 were infra only. Phase 4 wires the NestJS app up to all of it —
+plumbing and connectivity, still no business logic (auth guards, the
+device-switch flow, etc. — that's Phase 5).
 
 ## Services
 
 | Service | Purpose |
 |---|---|
-| `app-db` | Postgres dedicated to the future NestJS app. Empty — no schema yet. |
+| `app-db` | Postgres dedicated to the app. `app_user` (least-privilege, Phase 4) owns the `app` schema — see [Prisma schema/migrations](#database-prisma) below. |
 | `keycloak-db` | Postgres dedicated **solely** to Keycloak. Fully separate instance/volume from `app-db`, on its own isolated network — see "Why three data networks, not one" below. |
-| `keycloak` | Identity/auth provider. No realm/client/role config yet — see [infra/keycloak/README.md](keycloak/README.md). |
+| `keycloak` | Identity/auth provider. Realm `dealy`, three clients — see [infra/keycloak/README.md](keycloak/README.md). |
 | `redis` | Backing store for sessions, pub/sub, and future BullMQ job queues. |
-| `minio` | S3-compatible object storage for future media/image handling. |
-| `vault` | Secrets backbone (Phase 2). No public exposure, ever — see [infra/vault/README.md](vault/README.md). |
+| `minio` | S3-compatible object storage. Dedicated `dealy` bucket, scoped service-account credentials (Phase 4). |
+| `vault` | Secrets backbone. No public exposure, ever — see [infra/vault/README.md](vault/README.md). |
+| `nestjs-api` | The application itself (Phase 4). Connectivity to every service above, proven via `/health`. No auth guards or business logic yet. |
 | `reverse-proxy` | nginx. The **only** service reachable from outside Docker. |
 
 Not part of these phases (placeholders left in `docker-compose.yml` for
-where they'll attach): the NestJS API container, Kafka/Zookeeper, coturn.
+where they'll attach): Kafka/Zookeeper, coturn.
 
 ## Bringing the stack up locally
 
@@ -164,3 +166,179 @@ reserved path structure, and how Phase 3/4 write real secrets into it.
 datastores — but anything Phase 3+ generates (Keycloak client secrets, the
 app's real DB credentials, JWT signing keys, MinIO access keys) goes into
 Vault, not a file.
+
+## How the app sources its config and secrets (Phase 4)
+
+**The `.env` split, stated plainly:** `.env` holds exactly two categories
+of value now, and neither is what the running `nestjs-api` container reads
+for its own secrets:
+1. **Container bootstrap credentials** — `app-db`'s Postgres superuser,
+   MinIO's root user, Redis's `--requirepass` value, Keycloak's admin
+   login. These exist only because the *containers themselves* need them
+   to start up; nothing about them is Vault's concern.
+2. Everything else the app actually uses to talk to those services — the
+   dedicated `app_user` Postgres role, the scoped MinIO service-account
+   key, the JWT signing keypair, Keycloak's two client credential pairs,
+   and Redis's own password (yes, the *same* password as bootstrap, but
+   the app reads its copy from Vault, not from `.env` directly) — lives in
+   Vault, fetched once at startup by `VaultService`
+   (`src/vault/vault.service.ts`) and held in memory only.
+
+**AppRole, not `.env`, is how the app authenticates to Vault in the first
+place.** `role_id`/`secret_id` live in `infra/vault/approle/` (gitignored
+before either file existed), mounted read-only into `nestjs-api` at
+`/run/secrets/`. See [infra/vault/README.md](vault/README.md) for the
+ceremony that generated them and the dated reminder about `secret_id`'s
+expiry.
+
+**Fail loud, verified live, not just by reading the code:** if Vault is
+sealed or unreachable, or AppRole auth fails, `VaultService.onModuleInit`
+throws, `main.ts` catches it and calls `process.exit(1)` — no fallback to
+running without secrets. Confirmed with the actual production image: a
+corrupted `secret_id` produces a clean non-zero exit and a log line
+containing only a fixed safe message, never the bad value or a raw error
+object (`node-vault` is built on axios, whose error `.config` includes
+request headers — including the Vault token on any authenticated call —
+which is exactly why nothing catches and logs a raw error anywhere in this
+module).
+
+**Prisma** (`src/prisma/prisma.service.ts`) connects as `app_user` using
+Prisma 7's driver-adapter pattern (`@prisma/adapter-pg`), built from
+discrete Vault-sourced fields (host/port/user/password/database), not a
+connection-string URL — sidesteps URL-encoding entirely for whatever
+characters a generated password happens to contain. Migrations
+(`prisma/migrations/`) run separately via the Prisma CLI, authenticated
+with the Postgres *superuser* for the one step that genuinely needs it
+(shadow-database creation, which `app_user` deliberately can't do — that's
+the least-privilege design working as intended, not a gap) and with
+`app_user` for actually applying them. **Not automated — see "Running
+migrations" below for why and how.**
+
+### Running migrations — deliberately manual, not automated yet
+
+Neither `migrate dev` nor `migrate deploy` runs anywhere in the container
+startup path (`Dockerfile`'s `CMD` is exactly `node dist/main`). This is a
+**decision, not a gap**: the schema includes the single-active-device
+partial unique index — a real database-level guarantee with no
+first-class Prisma syntax, applied via hand-edited SQL (see the migration
+file). The call is to have a human watch that specific migration run a
+few more times, deliberately, before it's ever allowed to happen
+unattended. Automating it now would mean the first few times this
+exact schema change (or ones like it, touching the same constraint) gets
+applied for real, nobody's actually watching it happen. Revisit this once
+there's enough confidence in the process — not on a fixed timeline, on
+demonstrated repetition.
+
+**Standard procedure, until that changes** (this is exactly what was run
+to create and apply the current migration):
+
+1. **Bring up an intermediate build-stage image** — has the Prisma CLI
+   (a devDependency, not in the production image) and the compiled
+   source, without needing a fresh `npm ci` on every run:
+   ```sh
+   docker build --target build -t dealy-app-build-stage .
+   ```
+2. **Start a long-lived runner container**, attached to both networks it
+   needs — `data-net-appdb` (to reach `app-db`) and `app-net` (to reach
+   `vault`) — with the local `prisma/` directory mounted read-write so
+   generated migration files land directly on the host, and the AppRole
+   credentials mounted read-only:
+   ```sh
+   docker run -d --name prisma-runner \
+     --network dealy_data-net-appdb \
+     -v "$(pwd)/prisma:/app/prisma" \
+     -v "$(pwd)/infra/vault/approle:/run/secrets:ro" \
+     -w /app dealy-app-build-stage sleep 3600
+   docker network connect dealy_app-net prisma-runner
+   ```
+3. **For a new migration**: fetch the Postgres *superuser* password from
+   `.env` (needed only for this one step — shadow-database creation,
+   which `app_user` deliberately can't do), build a `DATABASE_URL` from it
+   piped via stdin (never a literal argument), and generate without
+   applying:
+   ```sh
+   docker exec prisma-runner sh -c 'DATABASE_URL=$(cat /tmp/db_url_super) npx prisma migrate dev --name <name> --create-only'
+   ```
+   Hand-edit the generated SQL for anything Prisma's schema syntax can't
+   express (partial indexes, etc.) **before** applying it.
+4. **To apply**: fetch `app_user`'s credentials from Vault via the
+   mounted AppRole (the same non-privileged read pattern the app itself
+   uses — no ceremony needed, this is exactly what `app-readonly` is
+   scoped for), build its `DATABASE_URL`, and run:
+   ```sh
+   docker exec prisma-runner sh -c 'DATABASE_URL=$(cat /tmp/db_url_appuser) npx prisma migrate deploy'
+   ```
+5. **Verify the result directly against the database**, not just the
+   command's exit code — check the tables/indexes exist with `psql`, and
+   for anything expressing a real constraint (like the partial unique
+   index), attempt the actual violation and confirm the database rejects
+   it. See the migration file's own comment for how that was done here.
+6. **Clean up**: `docker rm -f prisma-runner`, remove the build-stage
+   image if it's not needed again soon.
+
+If this ever does get automated, the design already accounts for it:
+`app_user` applying migrations via `migrate deploy` needs no privilege
+beyond what it already has (it owns the `app` schema); only *generating*
+a migration needs the superuser, which is itself a one-time,
+human-performed step per schema change, not a startup-time operation.
+
+**`app-db` and `keycloak-db` both override `pg_hba.conf`**
+(`infra/postgres/pg_hba.conf`, mounted read-only, `command: postgres -c
+hba_file=...`) to require `scram-sha-256` on every connection method,
+including Unix socket and loopback. The stock `postgres:16-alpine` image's
+*default* `pg_hba.conf` uses `trust` for local/loopback connections —
+meaning anything connecting via `-h localhost` or a bare Unix socket
+authenticates as any role with **no password check at all**. This was
+discovered the hard way during Phase 4: several password-rotation
+"verification" commands run against `localhost` reported success without
+ever actually checking the password, because `trust` doesn't check it —
+only a genuine cross-container connection over the real network
+(`-h app-db`, matching what the app and Prisma migrations actually use)
+exercises real authentication. Verified live: `pg_isready` (the
+healthcheck) doesn't need `trust` to work; unauthenticated `localhost`/socket
+connections now fail with `fe_sendauth: no password supplied`.
+
+**A structural gotcha worth remembering if this module gets touched
+again:** every service that depends on `VaultService` (Prisma, Redis,
+MinIO) builds its real client in its own `onModuleInit`, not its
+constructor. `VaultService` only populates its secrets in *its*
+`onModuleInit` — which Nest's lifecycle guarantees runs before a
+dependent's `onModuleInit`, but constructors for *all* providers run
+before *any* `onModuleInit` fires. Reading Vault secrets in a constructor
+crashes at startup ("Cannot destructure property 'x' of ... undefined"),
+found live on the first real smoke test of each module, not by reading
+the code.
+
+**Keycloak connectivity has a similar hostname gotcha:** `KC_HOSTNAME` is
+set to `localhost` for browser-facing access through the reverse proxy,
+which means Keycloak's own discovery document advertises `jwks_uri` (and
+`issuer`) as `http://localhost:8080/...` — correct for a browser, wrong
+for `nestjs-api`, where "localhost" means itself. `KeycloakService`
+deliberately does not follow the discovery document's self-reported
+`jwks_uri`; it builds the JWKS URL from the same known-good internal
+`KEYCLOAK_URL` used for the discovery fetch itself (the JWKS path is a
+fixed, standard OIDC endpoint, not something that varies).
+
+> **ACTION ITEM for Phase 5 — this fix does not cover `issuer`.** The fix
+> above is scoped to the JWKS URL only, used for the health check's own
+> internal fetch. `issuer` (and `authorization_endpoint`/`token_endpoint`,
+> not currently read anywhere in this codebase) are **not** touched by
+> it, and confirmed live to also read `http://localhost:8080/realms/dealy`
+> — the exact same value Keycloak embeds as the `iss` claim in every real
+> signed token, not just in the discovery document. This is *expected*
+> OIDC behavior (issuer is a logical identity string to validate against,
+> not a URL meant to be dereferenced the way `jwks_uri` is) — but it means
+> whatever token-validation code Phase 5 builds must compare the `iss`
+> claim against the **external** (`KC_HOSTNAME`-based) value, not the
+> internal `KEYCLOAK_URL` (`http://keycloak:8080`) used everywhere else in
+> this codebase for backend connectivity — those two are different values
+> today, confirmed live, and nothing currently captures the external one
+> anywhere. Don't let the internal `KEYCLOAK_URL` get reused by mistake as
+> the expected-issuer value when that code gets written.
+
+**`/health`** (`GET /health`, via `@nestjs/terminus`) reports live status
+for all five: `vault`, `keycloak`, `database`, `redis`, `minio`. Verified
+against the real stack — full JSON:
+```json
+{"status":"ok","info":{"vault":{"status":"up"},"keycloak":{"status":"up"},"database":{"status":"up"},"redis":{"status":"up"},"minio":{"status":"up"}},"error":{},"details":{...}}
+```

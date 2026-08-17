@@ -212,15 +212,23 @@ Phase 4 uses it again for its own setup, and so on.
 Enabled at `secret/` (`vault secrets enable -path=secret kv-v2`).
 Versioned, so credential rotation has history.
 
-Reserved path structure. `secret/keycloak/*` is now populated (Phase 3);
-the rest are still documented only, not populated:
+Path structure — all populated as of Phase 4:
 
-```
-secret/keycloak/     client secrets, admin credentials     — Phase 3 (populated)
-secret/app-db/       NestJS Postgres credentials            — Phase 4
-secret/jwt/          signing keys                           — Phase 4
-secret/minio/        access/secret keys                     — Phase 4
-```
+| Path | Fields | Phase |
+|---|---|---|
+| `secret/keycloak/nestjs-api` | `client_id`, `client_secret` | 3 |
+| `secret/keycloak/keycloak-admin-service` | `client_id`, `client_secret` | 3 |
+| `secret/app-db/credentials` | `username`, `password`, `host`, `port`, `database`, `schema` | 4 |
+| `secret/jwt/signing-key` | `algorithm=RS256`, `private_key`, `public_key` | 4 |
+| `secret/minio/credentials` | `access_key`, `secret_key`, `endpoint`, `bucket` | 4 |
+| `secret/redis/credentials` | `password`, `host`, `port` | 4 |
+
+`app-db`, `minio`, and `jwt` hold dedicated, least-privilege credentials
+generated specifically for the app (not the Postgres superuser or MinIO
+root credentials, which stay in `.env` as infrastructure bootstrap
+material — see `infra/README.md`). `redis` holds a copy of the same
+password `.env` uses to start the Redis container — the app reads its copy
+from here, not from `.env` directly.
 
 ## `keycloak-writer` policy (Phase 3 bootstrap only)
 
@@ -239,28 +247,56 @@ secret/minio/        access/secret keys                     — Phase 4
 - Auth method: `approle`, enabled.
 - Policy `app-readonly` (`infra/vault/policies/app-readonly.hcl`):
   read-only on `secret/data/app-db/*`, `secret/data/jwt/*`,
-  `secret/data/minio/*`. Deliberately excludes `secret/data/keycloak/*` —
-  the app has no legitimate reason to read Keycloak's own credentials.
+  `secret/data/minio/*`, `secret/data/redis/*` (added Phase 4).
+  Deliberately excludes `secret/data/keycloak/*` — the app has no
+  legitimate reason to read Keycloak's own credentials.
 - Role `nestjs-app`, bound to `app-readonly`, `token_ttl=1h`,
   `token_max_ttl=4h`.
 
-**No Secret ID has been generated.** That's a Phase 4 action, once the
-NestJS API container actually exists and needs to authenticate. When that
-phase arrives, bootstrapping the app's access looks like:
+**`secret_id` generated (Phase 4).** `role_id` and `secret_id` are in
+`infra/vault/approle/role_id` and `infra/vault/approle/secret_id` —
+gitignored (the directory was added to `.gitignore` before either file was
+created, not after), mounted read-only into the `nestjs-api` container.
+Neither value is a literal anywhere in `.env`, `docker-compose.yml`, or
+any committed file.
 
-```sh
-# Role ID — not itself secret, safe to store as ordinary config (akin to a client_id)
-vault read auth/approle/role/nestjs-app/role-id
+**TTL note — a real gotcha worth remembering:** the per-request override
+field on `POST auth/approle/role/:role/secret-id` is named `ttl`, not
+`secret_id_ttl` (that name is only valid inside the *role's own* config,
+set once in Phase 2). Using the wrong field name silently succeeds with no
+override applied — no error, easy to miss without checking. Separately,
+even the correct field is capped by the `auth/approle` mount's
+`max_lease_ttl`, which defaults to `768h` (32 days) and was never
+explicitly widened here. The `secret_id` generated this phase has an
+**effective TTL of 32 days**, not the 90 days originally intended —
+confirmed via `expiration_time` on an accessor lookup, not assumed from
+the request. If a longer lifetime is genuinely wanted later, that requires
+deliberately tuning the mount (`vault auth tune -max-lease-ttl=<value>
+approle`), a separate decision from generating the secret_id itself.
 
-# Secret ID — IS secret (akin to a client_secret). Generate it only when the
-# app is ready to consume it, and hand it to the app the same way the root
-# token was handled here: once, directly, never written to a repo file.
-vault write -f auth/approle/role/nestjs-app/secret-id
-```
+> **ACTION ITEM — dated, do not let this quietly disappear:** the current
+> `secret_id` expires **~2026-09-17**. Accepted as-is (32 days, not
+> extended) — but it *must* be regenerated via another regenerate-root
+> ceremony before that date, or the app's AppRole re-authentication starts
+> failing in production use. There is no auto-rotation in scope yet (no
+> Vault Agent, no cron). Whoever picks this up next should either: (a) run
+> the ceremony again close to the expiry date to mint a fresh `secret_id`
+> and overwrite `infra/vault/approle/secret_id`, or (b) at that time,
+> decide deliberately whether to widen the `auth/approle` mount's
+> `max_lease_ttl` so future rotations can be less frequent — don't let (b)
+> happen by default just because it's easier than doing (a) again. Also
+> tracked in the `project-vault-phasing` memory.
 
-The app then authenticates with `vault write auth/approle/login
+This is not a standing AppRole/persistent-service pattern like
+`keycloak-writer`'s token was for Phase 3 — `nestjs-app`'s `secret_id` *is*
+the app's standing credential, meant to be read from its mounted file
+every time the app authenticates, for the life of that file (until it
+expires or is rotated).
+
+The app authenticates with `vault write auth/approle/login
 role_id=... secret_id=...` to get a short-lived token scoped to
-`app-readonly`.
+`app-readonly`, reading both values from the mounted files — never typing
+either as a literal argument.
 
 ## Reproducing this setup (`bootstrap.sh`)
 
