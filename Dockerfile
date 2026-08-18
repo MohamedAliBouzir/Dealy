@@ -3,7 +3,7 @@ FROM node:22-alpine AS deps
 
 WORKDIR /app
 
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json .npmrc ./
 
 RUN npm ci
 
@@ -35,7 +35,7 @@ ENV NODE_ENV=production
 # script runs husky, a devDependency omitted here — without this flag the
 # install fails outright (husky: not found, exit 127). Lifecycle scripts
 # like git-hook setup have no purpose in a container with no .git anyway.
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json .npmrc ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 # Copy compiled output from build stage

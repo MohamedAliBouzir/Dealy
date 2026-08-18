@@ -25,7 +25,7 @@ infra/vault/data/
 infra/vault/*unseal*
 *.unseal
 vault-init.json
-
+.claude
 # AppRole credentials (role_id/secret_id) — mounted into the app container,
 # never committed. Directory created and gitignored before either file
 # exists (Phase 4 requirement, not an afterthought).
